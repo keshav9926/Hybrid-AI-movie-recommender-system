@@ -1,33 +1,42 @@
-# 🎬 Movie Recommender
+# 🎬 Cinematic Movie Recommender
 
-A **personalized movie recommendation app** built using Python and Streamlit. This project suggests movies based on IMDb data and your own movie ratings — helping you discover films you'll love.
+A premium, hyper-personalized, director-tuned movie recommendation system built with Python, Streamlit, and XGBoost. This system learns from your personal movie ratings to predict match scores, fetching real-time cover art via the OMDb API and presenting recommendations in an immersive glassmorphism card grid.
 
-🔗 **Live website:**  
-https://keshav9926-movie-recommender-app-ofv4l1.streamlit.app/
-
----
-
-## 💡 Overview
-
-The Movie Recommender predicts movies you might enjoy based on your preferences and past ratings. It leverages the IMDb Top 1000 dataset and your input to surface tailored movie suggestions.
+🔗 **Live Website:** [Streamlit App](https://keshav9926-movie-recommender-app-ofv4l1.streamlit.app/)
 
 ---
 
-## 🔗 Try It Live
+## 💡 Engine Architecture
 
-👉 **Open the app:**  
-https://keshav9926-movie-recommender-app-ofv4l1.streamlit.app/
+The core recommendation logic uses a **Hybrid Profile Affinity + Machine Learning Pipeline** designed to mimic real-world taste profiling. Rather than generic bag-of-words recommendations, the system implements:
 
-Share this link with friends to let them explore personalized movie recommendations!
+### 1. Structured Profile Affinity Engine
+Before training the regressor, the engine compiles a structured user profile:
+* **Director Affinity**: Computes the user's average rating for directors and scales the boost factor by $\sqrt{\text{count of rated movies by director}}$. This ensures that a single high rating doesn't skew recommendations as much as a sustained pattern of liking a director.
+* **Relative Genre Preference**: Scales genre preference weights against their global dataset prevalence (relative TF-IDF weighting). This prevents dominant tags (like *Drama* or *Comedy*) from washing out strong niche signals (like *Mystery*, *Sci-Fi*, or *Thriller*).
+* **Star/Actor Affinity**: Compiles an average rating vector across all four cast columns in the dataset.
+
+### 2. XGBoost Baseline Regressor
+* Learns textual nuances from plot overviews, decade indicators, directors, cast, and genres using TF-IDF vectorization.
+* Predicts a baseline rating score for unrated movies based on metadata features.
+
+### 3. Diversity-Collapsing Filter
+* Prevents recommendation listing dumps (e.g. recommending 5 Hitchcock movies in a row).
+* Limits recommendations to **at most 1 movie per director** to keep suggestions diverse and fresh.
+
+### 4. Language Whitelist Audit
+* The system is audited to filter out non-English films (e.g. *Pan's Labyrinth*, *Uri: The Surgical Strike*) to ensure all recommendations align with English language titles and dialogues as requested. The whitelisted movies are verified using OMDb API queries and cached in `english_movies.json`.
 
 ---
 
-## 🚀 Features
+## 🎨 Interface Features
 
-- 📊 Recommendations based on IMDb’s Top 1000 movies  
-- ⭐ Personalized suggestions based on user ratings  
-- 🎛 Interactive UI built with Streamlit  
-- 🐍 Developed using Python and Pandas  
+* **Glassmorphic Theme**: A dark space-themed background (`#0e111a`) with magenta-pink and orange-yellow neon gradients.
+* **Dynamic Cover Art Fetching**: Concurrently queries the OMDb API for high-resolution posters in the background (using a thread pool to avoid slowing down page loads).
+* **Interactive Tabs**:
+  * **🎯 AI Recommendations**: Instantly generates your Top 12 tailored movies in a responsive two-column grid.
+  * **✍️ Rate Movies**: Select any movie to see its poster and overview, adjust your score with a slider, and save/remove ratings.
+  * **📋 Rated Catalog**: View a table of all your previously rated films.
 
 ---
 
@@ -35,35 +44,43 @@ Share this link with friends to let them explore personalized movie recommendati
 
 ```text
 movie_recommender/
-├── app.py                   # Main Streamlit application
-├── imdb_top_1000.csv        # Movie dataset
-├── my_ratings.csv           # Personal ratings
-├── web.ipynb                # Notebook for model development
-├── requirements.txt         # Python dependencies
-└── README.md                # Project documentation
+├── app.py                  # Streamlit application & hybrid recommendation logic
+├── english_movies.json     # Whitelisted English-only movie titles catalog
+├── imdb_top_1000.csv       # Movie metadata dataset
+├── my_ratings.csv          # Local user ratings database
+├── web.ipynb               # Model development notebook
+├── requirements.txt        # Python library dependencies
+└── README.md               # Project documentation
 ```
+
 ---
 
-## 🚀 Installation (Run Locally)
-1️⃣ Clone the repository
-```
+## 🚀 Run Locally
+
+### 1️⃣ Clone the Repository
+```bash
 git clone https://github.com/keshav9926/movie_recommender.git
 cd movie_recommender
 ```
 
-2️⃣ Create and activate a virtual environment
-```
+### 2️⃣ Set Up Virtual Environment
+```bash
+# Windows PowerShell
 python -m venv venv
-source venv/bin/activate      # macOS / Linux
-venv\Scripts\activate         # Windows
+venv\Scripts\activate
+
+# macOS / Linux
+python -m venv venv
+source venv/bin/activate
 ```
 
-3️⃣ Install dependencies
-```
+### 3️⃣ Install Dependencies
+```bash
 pip install -r requirements.txt
 ```
 
-4️⃣ Run the Streamlit app
-```
+### 4️⃣ Run the App
+```bash
 streamlit run app.py
 ```
+*The app will automatically open in your browser at `http://localhost:8501`.*
