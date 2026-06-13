@@ -246,13 +246,27 @@ def render_detail_card(movie, poster_url=None):
 
 # Recommendation Engine Logic (Hybrid Profile Affinity + XGBoost with Diversity Filtering)
 def train_and_recommend(movies_df, top_n=10):
+    # -------------------------------------------------------------------------
+    # MACHINE LEARNING CONCEPT: DATA SPLITTING & COLD START HANDLING
+    # - "rated" acts as our Training Set (labeled data where the target variable is 'My_Rating').
+    # - "unrated" acts as our Test Set/Prediction Target (unlabeled data where we want to predict 'My_Rating').
+    # - If the user has rated fewer than 2 movies, we cannot train an XGBoost model or build robust affinity profiles.
+    # -------------------------------------------------------------------------
     rated = movies_df[movies_df[RATING_COL].notnull()]
     unrated = movies_df[movies_df[RATING_COL].isnull()]
 
     if len(rated) < 2:
         return None
 
-    # Calculate global genre counts for relative preference weighting
+    # -------------------------------------------------------------------------
+    # ML CONCEPT: FEATURE ENGINEERING - USER PROFILE AFFINITIES
+    # We build custom preference dictionaries to capture the user's affinity towards:
+    # 1. Directors (Who directed the movie?)
+    # 2. Stars/Actors (Who acts in the movie?)
+    # 3. Genres (What category does the movie belong to?)
+    # -------------------------------------------------------------------------
+    
+    # Calculate global genre frequencies across the entire dataset to handle bias correction
     global_genre_counts = {}
     for genres_str in movies_df['Genre']:
         if pd.notnull(genres_str):
@@ -260,12 +274,11 @@ def train_and_recommend(movies_df, top_n=10):
                 g_clean = g.strip()
                 global_genre_counts[g_clean] = global_genre_counts.get(g_clean, 0) + 1
 
-    # 1. Compute User Affinities
-    # Director affinity
+    # Compute director average ratings and the count of movies rated under each director
     director_ratings = rated.groupby('Director')[RATING_COL].mean().to_dict()
     director_counts = rated.groupby('Director').size().to_dict()
 
-    # Star affinity
+    # Compute star average ratings by checking across all 4 cast members in the dataset
     star_ratings = {}
     for star_col in ['Star1', 'Star2', 'Star3', 'Star4']:
         for star, rating in zip(rated[star_col], rated[RATING_COL]):
@@ -273,7 +286,7 @@ def train_and_recommend(movies_df, top_n=10):
                 star_ratings.setdefault(star, []).append(rating)
     star_avg_ratings = {k: np.mean(v) for k, v in star_ratings.items()}
 
-    # Genre affinity
+    # Compute genre average ratings and genre counts rated by the user
     genre_ratings = {}
     genre_counts = {}
     for genres_str, rating in zip(rated['Genre'], rated[RATING_COL]):
@@ -284,15 +297,35 @@ def train_and_recommend(movies_df, top_n=10):
                 genre_counts[g_clean] = genre_counts.get(g_clean, 0) + 1
     genre_avg_ratings = {k: np.mean(v) for k, v in genre_ratings.items()}
 
-    # 2. XGBoost Baseline
+    # -------------------------------------------------------------------------
+    # ML CONCEPT: NATURAL LANGUAGE PROCESSING (NLP) & TF-IDF VECTORIZATION
+    # - TfidfVectorizer converts text overviews/plots into numeric feature matrices.
+    # - Term Frequency (TF): Measures how frequently a word appears in a specific movie overview.
+    # - Inverse Document Frequency (IDF): Dampens words that appear across almost all movies (like "the", "movie", "story")
+    #   and highlights rare, descriptive words (like "detective", "stranger", "space", "crime").
+    # - fit_transform() learns the vocabulary and vectorizes the training text (rated).
+    # - transform() vectorizes the test text (unrated) using the same learned vocabulary.
+    # -------------------------------------------------------------------------
     tfidf = TfidfVectorizer(max_features=2000, ngram_range=(1, 2), stop_words='english')
     X_rated = tfidf.fit_transform(rated['text_data'])
     X_unrated = tfidf.transform(unrated['text_data'])
 
+    # Combine text features with numeric features (IMDb Rating and Metacritic Score) using sparse matrices (hstack)
     X_train = hstack([X_rated, csr_matrix(rated[['IMDB_Rating', 'Meta_score']])])
     y_train = rated[RATING_COL].values
     X_unrated_xgb = hstack([X_unrated, csr_matrix(unrated[['IMDB_Rating', 'Meta_score']])])
 
+    # -------------------------------------------------------------------------
+    # ML CONCEPT: SUPERVISED LEARNING (GRADIENT BOOSTING REGRESSION)
+    # - XGBRegressor is an ensemble model that builds sequential decision trees.
+    # - Each new tree is trained to correct the errors (residuals) of the previous trees.
+    # - Why XGBoost? It handles non-linear relationships, text vector features, and numerical data exceptionally well.
+    # - Hyperparameters used:
+    #   * objective='reg:squarederror': Optimizes the Mean Squared Error (MSE) loss.
+    #   * n_estimators=100: Number of trees built.
+    #   * learning_rate=0.05: Shrinks the contribution of each tree to prevent overfitting.
+    #   * max_depth=3: Limits tree depth to keep trees simple and prevent memorizing training data.
+    # -------------------------------------------------------------------------
     model = xgb.XGBRegressor(
         objective='reg:squarederror',
         n_estimators=100,
@@ -303,19 +336,32 @@ def train_and_recommend(movies_df, top_n=10):
     model.fit(X_train, y_train)
     xgb_preds = model.predict(X_unrated_xgb)
 
-    # 3. Custom Score calculation
+    # -------------------------------------------------------------------------
+    # ML CONCEPT: HYBRID ENSEMBLE COMBINATION
+    # To combine general content similarities (XGBoost) with hyper-specific preferences:
+    # 1. We start with the XGBoost baseline prediction.
+    # 2. We apply a Director Boost: Weight scaled by sqrt(movies_count) so that
+    #    multiple ratings carry higher significance than a single high rating.
+    # 3. We apply an Actor Boost.
+    # 4. We apply a Relative Genre Preference Boost: Inspired by TF-IDF, it divides the user's rated genre ratio
+    #    by the global genre ratio in the dataset. This highlights niche genres (e.g. Film-Noir) that the user loves
+    #    and down-weights generic genres (e.g. Drama) that are everywhere.
+    # -------------------------------------------------------------------------
     custom_preds = []
     for idx, row in unrated.iterrows():
         xgb_pred = xgb_preds[len(custom_preds)]
         
+        # Calculate Director Boost
         dir_name = row['Director']
         dir_score = director_ratings.get(dir_name, None)
         dir_count = director_counts.get(dir_name, 0)
         
+        # Calculate Star/Actor Boost
         stars = [row['Star1'], row['Star2'], row['Star3'], row['Star4']]
         star_scores = [star_avg_ratings.get(s) for s in stars if s in star_avg_ratings]
         star_score = np.mean(star_scores) if star_scores else None
         
+        # Calculate Genre Boost with TF-IDF Prevalence Ratio
         genres = [g.strip() for g in row['Genre'].split(',')]
         g_scores = []
         g_weights = []
@@ -334,10 +380,11 @@ def train_and_recommend(movies_df, top_n=10):
             genre_score = None
             genre_count_factor = 0
         
-        # De-emphasize general XGBoost predictions in favor of personal preferences
+        # Assemble custom hybrid scores (offset from middle rating 5.0 to calculate boosts/penalties)
         score = 0.15 * xgb_pred
         
         if dir_score is not None:
+            # sqrt(dir_count) rewards multiple positive occurrences (e.g. liking 3 Hitchcock films carries more weight than 1)
             count_factor = np.sqrt(dir_count)
             score += 3.8 * (dir_score - 5.0) * count_factor
         if star_score is not None:
@@ -347,7 +394,10 @@ def train_and_recommend(movies_df, top_n=10):
             
         custom_preds.append(score)
 
-    # Scale final scores
+    # -------------------------------------------------------------------------
+    # ML CONCEPT: MIN-MAX FEATURE SCALING (NORMALIZATION)
+    # Scaled predictions back to a standard user-friendly rating scale (1.0 to 10.0 stars).
+    # -------------------------------------------------------------------------
     min_score, max_score = min(custom_preds), max(custom_preds)
     if max_score - min_score > 1e-5:
         custom_preds_scaled = [1.0 + 9.0 * (s - min_score) / (max_score - min_score) for s in custom_preds]
@@ -358,7 +408,11 @@ def train_and_recommend(movies_df, top_n=10):
     unrated['Predicted_My_Rating'] = custom_preds_scaled
     recs_all = unrated.sort_values(by='Predicted_My_Rating', ascending=False)
 
-    # Apply diversity filter
+    # -------------------------------------------------------------------------
+    # ML CONCEPT: DIVERSITY FILTERING (COLLAPSING RECOMMENDATIONS)
+    # - Recommender systems often suffer from "filter bubbles" where the list is saturated by one category.
+    # - Here, we collapse predictions to at most 1 film per director to maximize the variety of the recommendations.
+    # -------------------------------------------------------------------------
     diverse_recs = []
     seen_directors = set()
 
@@ -371,6 +425,7 @@ def train_and_recommend(movies_df, top_n=10):
             break
 
     return pd.DataFrame(diverse_recs)
+
 
 
 
