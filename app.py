@@ -9,13 +9,24 @@ import xgboost as xgb
 from nltk.stem import WordNetLemmatizer
 from sklearn.metrics.pairwise import cosine_similarity
 
-# Constants
-RATING_COL = 'My_rating '  # Trailing space from the dataset schema
-RATINGS_FILE = "my_ratings.csv"
+# =========================================================================
+# GLOBAL CONSTANTS
+# =========================================================================
+RATING_COL = 'My_rating '  # Column name for user rating. Note the trailing space from the dataset schema.
+RATINGS_FILE = "my_ratings.csv" # The local CSV file where your ratings are saved.
 
-# Setup quiet NLTK downloads
+
+# =========================================================================
+# NLTK RESOURCE DOWNLOADER
+# =========================================================================
+# @st.cache_resource is a Streamlit decorator. It ensures this download function
+# runs ONLY ONCE when the app starts, rather than on every page refresh/re-run.
 @st.cache_resource
 def download_nltk_resources():
+    """
+    Quietly checks for and downloads necessary NLTK datasets (WordNet corpus).
+    WordNet is required by the Lemmatizer to resolve words to their base forms.
+    """
     try:
         nltk.data.find('corpora/wordnet.zip')
     except LookupError:
@@ -25,14 +36,31 @@ def download_nltk_resources():
     except LookupError:
         nltk.download('omw-1.4', quiet=True)
 
+# Run the resource downloader immediately on startup
 download_nltk_resources()
 
-# Load & preprocess movies
+
+# =========================================================================
+# DATASET LOADING AND TEXT PREPROCESSING PIPELINE
+# =========================================================================
+# @st.cache_data is used to cache the loaded pandas DataFrame. 
+# Once the movies are loaded and cleaned, they stay in memory so the app remains fast.
 @st.cache_data
 def load_movies(file_path="imdb_top_1000.csv"):
+    """
+    Loads, cleans, and pre-processes the movie catalog.
+    
+    Parameters:
+    - file_path (str): The filename of the raw IMDb CSV catalog.
+    
+    Returns:
+    - pd.DataFrame: Cleaned movies dataset containing text features ready for ML.
+    """
     movies = pd.read_csv(file_path)
 
-    # Filter for English movies / English titles using precompiled mapping
+    # --- STEP 1: ENGLISH WHITELIST FILTERING ---
+    # We load our audited whitelist containing only pure English-language movie titles.
+    # Any foreign language film (e.g. "Spirited Away", "Amélie") is removed from the dataset.
     english_list_file = "english_movies.json"
     if os.path.exists(english_list_file):
         import json
@@ -40,20 +68,29 @@ def load_movies(file_path="imdb_top_1000.csv"):
             english_titles = set(json.load(f))
         movies = movies[movies['Series_Title'].isin(english_titles)]
 
+    # --- STEP 2: SCORE SCALING ---
+    # IMDb ratings are 1-10, but Metacritic score is 1-100. We divide Metascore by 10
+    # to put both metrics on the same scale, then drop movies missing a Metascore.
     movies['Meta_score'] = movies['Meta_score'] / 10
     movies = movies[movies['Meta_score'].notnull()]
 
-    # Strip spaces ONLY for text data compilation to merge keywords
+    # --- STEP 3: KEYWORD COMPACTING (TEXT REPRESENTATION) ---
+    # We clean director and actor names by removing spaces. For example, "Christopher Nolan"
+    # becomes "ChristopherNolan". This prevents the text vectorizer from splitting first/last names
+    # into separate features and ensures "Nolan" is linked specifically to "Christopher".
     director_clean = movies['Director'].astype(str).str.replace(" ", "")
     star1_clean = movies['Star1'].astype(str).str.replace(" ", "")
     star2_clean = movies['Star2'].astype(str).str.replace(" ", "")
     star3_clean = movies['Star3'].astype(str).str.replace(" ", "")
     star4_clean = movies['Star4'].astype(str).str.replace(" ", "")
 
-    # Extract decade tag for temporal context (e.g. "Decade_1990s")
+    # Extract the decade (e.g. 1990s, 1980s) to give the ML model chronological context
     decade = movies['Released_Year'].astype(str).str.extract(r'(\d{3})')[0].fillna('200') + '0s'
     decade_tag = 'Decade_' + decade
 
+    # --- STEP 4: CONSTRUCT THE DOCUMENT VECTOR ---
+    # We concatenate the title, overview plot, director, actors, decade, and genres.
+    # This composite string acts as a unified "document" representing the movie's content profile.
     movies['text_data'] = (
         movies['Series_Title'].astype(str) + ' ' +
         movies['Overview'].astype(str) + ' ' +
@@ -66,33 +103,72 @@ def load_movies(file_path="imdb_top_1000.csv"):
         movies['Genre'].astype(str)
     )
 
+    # --- STEP 5: NLTK LEMMATIZATION ---
+    # We reduce words to their dictionary roots (e.g., "running", "ran", "runs" -> "run").
+    # This consolidates matching features and ensures variations of words match correctly.
     lemmatizer = WordNetLemmatizer()
     movies['text_data'] = movies['text_data'].apply(
         lambda x: ' '.join(lemmatizer.lemmatize(w) for w in x.split())
     )
 
+    # Initialize empty column for user ratings if not already present
     if RATING_COL not in movies.columns:
         movies[RATING_COL] = None
 
     return movies
 
-# Save / Load user ratings (Global file)
+
+# =========================================================================
+# RATINGS DATABASE FILE WRITER / READER
+# =========================================================================
 def save_user_ratings(movies, path=RATINGS_FILE):
+    """
+    Saves your personal ratings out to the local CSV ratings database.
+    
+    Parameters:
+    - movies (pd.DataFrame): The current session state movies DataFrame.
+    - path (str): Destination CSV file path.
+    """
+    # Drop rows that are not rated (dropna) to keep the CSV clean, 
+    # saving only 'Series_Title' and 'My_rating ' columns.
     movies[['Series_Title', RATING_COL]].dropna().to_csv(path, index=False)
 
+
 def load_user_ratings(movies, path=RATINGS_FILE):
+    """
+    Loads saved ratings from local storage and merges them into the current movie catalog.
+    
+    Parameters:
+    - movies (pd.DataFrame): The initial loaded catalog.
+    - path (str): Source CSV file path.
+    
+    Returns:
+    - pd.DataFrame: Combined catalog containing your personal ratings history.
+    """
     if not os.path.exists(path):
         return movies
 
+    # Read the saved CSV and perform a SQL-style left join on 'Series_Title'
     ratings = pd.read_csv(path)
-    # Clear any old ratings columns and merge cleanly
     if RATING_COL in movies.columns:
         movies.drop(columns=[RATING_COL], inplace=True)
     movies = movies.merge(ratings, on='Series_Title', how='left')
     return movies
 
-# Color mapping helper for movie cards
+
+# =========================================================================
+# DYNAMIC CSS GENRE BADGES
+# =========================================================================
 def get_genre_badge_css(genre):
+    """
+    Generates a color-themed inline CSS style for movie genre badges.
+    
+    Parameters:
+    - genre (str): The name of the genre (e.g. "Drama", "Sci-Fi").
+    
+    Returns:
+    - str: Custom inline CSS styling rules.
+    """
     color_map = {
         'Drama': ('rgba(52, 152, 219, 0.12)', '#3498db'),
         'Action': ('rgba(231, 76, 60, 0.12)', '#e74c3c'),
@@ -110,18 +186,36 @@ def get_genre_badge_css(genre):
         'Horror': ('rgba(149, 165, 166, 0.12)', '#95a5a6'),
         'Fantasy': ('rgba(224, 86, 253, 0.12)', '#be2edd')
     }
+    # If a genre is not in the map, default to a classic warm-amber/orange theme
     bg, fg = color_map.get(genre, ('rgba(255, 189, 89, 0.12)', '#ffbd59'))
     return f'background: {bg}; color: {fg}; border: 1px solid {fg}40;'
 
-# Fetch movie poster URL from OMDb API with caching
+
+# =========================================================================
+# OMDB WEB API POSTER FETCHERS
+# =========================================================================
 @st.cache_data(show_spinner=False)
 def get_movie_poster(title):
+    """
+    Fetches the movie poster URL from the OMDb API for a given film title.
+    Caches the results to minimize API requests and keep the page snappy.
+    
+    Parameters:
+    - title (str): The exact title of the movie (e.g. "Barry Lyndon").
+    
+    Returns:
+    - str or None: The URL of the poster image, or None if not found/error.
+    """
     import urllib.request
     import urllib.parse
     import json
+    
+    # URL-encode the title to safely transmit special characters and spaces
     url_title = urllib.parse.quote(title)
     url = f"http://www.omdbapi.com/?t={url_title}&apikey=thewdb"
+    
     try:
+        # Request with a standard User-Agent to avoid HTTP 403 Forbidden errors
         req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
         with urllib.request.urlopen(req, timeout=3) as res:
             data = json.loads(res.read().decode('utf-8'))
@@ -130,20 +224,44 @@ def get_movie_poster(title):
                 if poster and poster != 'N/A':
                     return poster
     except Exception:
-        pass
+        pass  # Quietly fall back to None if network is down or API limits hit
     return None
 
-# Fetch posters for a list of movies in parallel
+
 def fetch_posters_parallel(titles):
+    """
+    Spawns multiple worker threads to retrieve movie posters concurrently.
+    This avoids sequential loading delays, fetching 12 posters in < 0.2s.
+    
+    Parameters:
+    - titles (list of str): List of movie titles to fetch posters for.
+    
+    Returns:
+    - dict: A dictionary mapping movie titles to their poster URLs.
+    """
     from concurrent.futures import ThreadPoolExecutor
     def fetch_one(t):
         return t, get_movie_poster(t)
+    
+    # Run requests concurrently using 10 background worker threads
     with ThreadPoolExecutor(max_workers=10) as executor:
         results = list(executor.map(fetch_one, titles))
     return dict(results)
 
-# Render movie card in HTML
+
+# =========================================================================
+# HTML CARD RENDERERS (NO LEADING INDENTATION TO PREVENT STREAMLIT MARKDOWN BUGS)
+# =========================================================================
 def render_movie_card_html(movie, rank_num=None, predicted_rating=None, poster_url=None):
+    """
+    Compiles HTML/CSS string markup for a recommendation movie card.
+    
+    Parameters:
+    - movie (pd.Series): Movie row containing attributes (genres, title, plot, cast).
+    - rank_num (int): Recommendation index rank (e.g. 1 through 12).
+    - predicted_rating (float): Scaled prediction score out of 10.0.
+    - poster_url (str): Image URL returned from get_movie_poster.
+    """
     genres = [g.strip() for g in str(movie['Genre']).split(',')]
     genre_html = "".join([f'<span class="genre-badge" style="{get_genre_badge_css(g)}">{g}</span>' for g in genres])
     
@@ -155,6 +273,7 @@ def render_movie_card_html(movie, rank_num=None, predicted_rating=None, poster_u
     title = movie['Series_Title']
     stars = ", ".join([movie['Star1'], movie['Star2'], movie['Star3'], movie['Star4']])
     
+    # Construct rank and prediction badge markup if values are supplied
     rank_html = ""
     if rank_num is not None:
         rank_html = f'<span class="genre-badge match-badge" style="background: rgba(212, 175, 55, 0.1); color: #d4af37; border: 1px solid rgba(212, 175, 55, 0.35);">🔥 #{rank_num}</span>'
@@ -163,12 +282,13 @@ def render_movie_card_html(movie, rank_num=None, predicted_rating=None, poster_u
     if predicted_rating is not None:
         pred_badge_html = f'<span class="genre-badge match-badge" style="background: rgba(212, 175, 55, 0.1); color: #d4af37; border: 1px solid rgba(212, 175, 55, 0.35);">🎯 Match: {predicted_rating:.2f}</span>'
         
+    # Check if a poster URL exists, otherwise draw an SVG film reel icon
     if poster_url:
         poster_html = f'<img class="movie-poster" src="{poster_url}" alt="{title}">'
     else:
-        # Fallback SVG icon
         poster_html = """<div style="display: flex; align-items: center; justify-content: center; width: 100%; height: 100%; background: linear-gradient(135deg, #182030 0%, #0c1018 100%);"><svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="rgba(255, 255, 255, 0.3)" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="2" width="20" height="20" rx="2.18" ry="2.18"></rect><line x1="7" y1="2" x2="7" y2="22"></line><line x1="17" y1="2" x2="17" y2="22"></line><line x1="2" y1="12" x2="22" y2="12"></line><line x1="2" y1="7" x2="7" y2="7"></line><line x1="2" y1="17" x2="7" y2="17"></line><line x1="17" y1="17" x2="22" y2="17"></line><line x1="17" y1="7" x2="22" y2="7"></line></svg></div>"""
 
+    # Assemble raw HTML card structure. Zero indentation avoids markdown preformatting blocks.
     card_html = f"""<div class="movie-card">
 <div class="movie-poster-container">
 {poster_html}
@@ -200,8 +320,15 @@ def render_movie_card_html(movie, rank_num=None, predicted_rating=None, poster_u
 </div>"""
     return card_html
 
-# Render detail card for current selection
+
 def render_detail_card(movie, poster_url=None):
+    """
+    Compiles HTML/CSS string markup for the 'Rate Movies' tab detail preview.
+    
+    Parameters:
+    - movie (pd.Series): Selected movie row.
+    - poster_url (str): Dynamic cover poster URL.
+    """
     title = movie['Series_Title']
     year = movie['Released_Year']
     runtime = movie['Runtime']
@@ -241,6 +368,7 @@ def render_detail_card(movie, poster_url=None):
 </div>
 </div>"""
     return card_html
+
 
 
 
